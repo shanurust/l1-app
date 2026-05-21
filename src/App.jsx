@@ -1441,6 +1441,77 @@ export default function App() {
             </div>
           </div>
 
+          <div className="editor-card">
+            <h3>Demand Adjustments</h3>
+            <label>
+              Demand Delta: {formatPct(scenario.demandDeltaPct)}
+              <input
+                type="range"
+                min="-0.3"
+                max="0.5"
+                step="0.01"
+                value={scenario.demandDeltaPct}
+                onChange={(event) =>
+                  setScenario((prev) => ({ ...prev, demandDeltaPct: Number(event.target.value) }))
+                }
+              />
+            </label>
+
+            <div className="range-grid">
+              <label>
+                Shift Start Week
+                <input
+                  type="number"
+                  min="1"
+                  max={DEMAND_PLANNING_WEEKS}
+                  value={scenario.demandShiftStartWeek}
+                  onChange={(event) =>
+                    setScenario((prev) => {
+                      const startWeek = clamp(Number(event.target.value) || 1, 1, DEMAND_PLANNING_WEEKS)
+                      return {
+                        ...prev,
+                        demandShiftStartWeek: startWeek,
+                        demandShiftEndWeek: Math.max(prev.demandShiftEndWeek, startWeek),
+                      }
+                    })
+                  }
+                />
+              </label>
+              <label>
+                Shift End Week
+                <input
+                  type="number"
+                  min="1"
+                  max={DEMAND_PLANNING_WEEKS}
+                  value={scenario.demandShiftEndWeek}
+                  onChange={(event) =>
+                    setScenario((prev) => {
+                      const endWeek = clamp(Number(event.target.value) || DEMAND_PLANNING_WEEKS, 1, DEMAND_PLANNING_WEEKS)
+                      return {
+                        ...prev,
+                        demandShiftEndWeek: Math.max(prev.demandShiftStartWeek, endWeek),
+                      }
+                    })
+                  }
+                />
+              </label>
+            </div>
+
+            <label>
+              Weeks {scenario.demandShiftStartWeek}-{scenario.demandShiftEndWeek} Demand Shift: {formatPct(scenario.demandShiftDeltaPct)}
+              <input
+                type="range"
+                min="-0.4"
+                max="0.5"
+                step="0.01"
+                value={scenario.demandShiftDeltaPct}
+                onChange={(event) =>
+                  setScenario((prev) => ({ ...prev, demandShiftDeltaPct: Number(event.target.value) }))
+                }
+              />
+            </label>
+          </div>
+
           <label>
             Supplier Split Strategy
             <select
