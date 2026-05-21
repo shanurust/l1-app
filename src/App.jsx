@@ -17,6 +17,12 @@ const DEFAULT_DEMAND_SERIES = Array.from({ length: DEMAND_PLANNING_WEEKS }, (_, 
     ? DEFAULT_WEEKLY_DEMAND
     : DEFAULT_DEMAND_SHIFT_SERIES[index - DEMAND_STABLE_WEEKS] || DEFAULT_WEEKLY_DEMAND
 ))
+const DEFAULT_COST_DATA = {
+  plantProductPenaltyPerUnit: 1.8,
+  plantInventoryPenaltyPerUnit: 0.48,
+  dcInventoryPenaltyPerUnit: 0.72,
+  retailerMissedDemandPenaltyPerUnit: 4.5,
+}
 
 const PALETTE_TYPES = [
   { type: 'supplier', label: 'Supplier' },
@@ -63,6 +69,7 @@ const BASE_SCENARIO = {
   supplierLeadTimeDeltaPct: 0,
   transportCostDeltaPct: 0,
   serviceLevelTarget: 0.95,
+  costData: { ...DEFAULT_COST_DATA },
 }
 
 const SCENARIO_PRESETS = [
@@ -132,6 +139,7 @@ function runScenario(nodes, lanes, scenario) {
   const customers = nodes.filter((node) => node.type === 'customer')
   const plants = nodes.filter((node) => node.type === 'plant')
   const dcs = nodes.filter((node) => node.type === 'dc')
+  const costData = { ...DEFAULT_COST_DATA, ...scenario.costData }
 
   const customerDemandBaseline = customers.reduce((acc, customer) => acc + customer.demand, 0)
   const fallbackDemand = customerDemandBaseline > 0 ? customerDemandBaseline : DEFAULT_WEEKLY_DEMAND
@@ -217,12 +225,20 @@ function runScenario(nodes, lanes, scenario) {
 
   const baseLaneCost = lanes.filter((lane) => lane.active).reduce((sum, lane) => sum + lane.costPerUnit, 0) / Math.max(lanes.filter((lane) => lane.active).length, 1)
   const baseLaneLead = lanes.filter((lane) => lane.active).reduce((sum, lane) => sum + lane.leadTimeDays, 0) / Math.max(lanes.filter((lane) => lane.active).length, 1)
+  const plantInventoryOnHand = plants.reduce((sum, plant) => sum + (plant.inventoryOnHand || 0), 0)
+  const dcInventoryOnHand = dcs.reduce((sum, dc) => sum + (dc.inventoryOnHand || 0), 0)
+  const beginningInventory = plantInventoryOnHand + dcInventoryOnHand
+  const plantInventoryShare = beginningInventory > 0 ? plantInventoryOnHand / beginningInventory : 0.5
+  const dcInventoryShare = beginningInventory > 0 ? dcInventoryOnHand / beginningInventory : 0.5
+  const blendedInventoryPenaltyPerUnit =
+    costData.plantInventoryPenaltyPerUnit * plantInventoryShare
+    + costData.dcInventoryPenaltyPerUnit * dcInventoryShare
 
   const procurementCost = allocations.reduce((sum, allocation) => sum + allocation.quantity * allocation.unitCost, 0)
   const transportCost = totalAllocated * baseLaneCost * (1 + scenario.transportCostDeltaPct)
-  const inventoryHoldingCost = (totalAllocated + overstockFromMoq) * (baseLaneLead / 30) * 0.72
-  const stockoutPenalty = unmet * 4.5
-  const plantUnitPenalty = plants.reduce((sum, plant) => sum + (plant.costPerUnit || 0), 0) / Math.max(plants.length, 1)
+  const inventoryHoldingCost = (totalAllocated + overstockFromMoq) * (baseLaneLead / 30) * blendedInventoryPenaltyPerUnit
+  const stockoutPenalty = unmet * costData.retailerMissedDemandPenaltyPerUnit
+  const plantUnitPenalty = costData.plantProductPenaltyPerUnit
   const plantProductionPenalty = fulfilledDemand * plantUnitPenalty
   const productionPenalty = procurementCost + plantProductionPenalty
   const transportationPenalty = transportCost
@@ -233,10 +249,7 @@ function runScenario(nodes, lanes, scenario) {
 
   const avgLeadTime = allocations.reduce((sum, allocation) => sum + allocation.leadTimeDays * allocation.share, 0) + baseLaneLead
   const weightedRisk = allocations.reduce((sum, allocation) => sum + allocation.risk * allocation.share, 0)
-  const plantInventoryOnHand = plants.reduce((sum, plant) => sum + (plant.inventoryOnHand || 0), 0)
-  const dcInventoryOnHand = dcs.reduce((sum, dc) => sum + (dc.inventoryOnHand || 0), 0)
   const dcSafetyStock = dcs.reduce((sum, dc) => sum + (dc.safetyStock || 0), 0)
-  const beginningInventory = plantInventoryOnHand + dcInventoryOnHand
   const endingInventory = Math.max(beginningInventory + totalAllocated - demand, 0)
   const dailyDemand = demand / Math.max(planningWeeks * 7, 1)
   const daysOfSupply = endingInventory / Math.max(dailyDemand, 1e-6)
@@ -272,7 +285,10 @@ function runScenario(nodes, lanes, scenario) {
     alerts.push('Transportation penalty spike detected.')
   }
   if (criticalUnavailableLanes.length > 0) {
-    alerts.push('One or more lanes unavailable: delivery flow constrained.')
+    const laneNames = criticalUnavailableLanes
+      .map((lane) => formatLaneDisplayName(lane, nodes))
+      .join(', ')
+    alerts.push(`Lane unavailable: ${laneNames}. Delivery flow constrained.`)
   }
   if (overstockFromMoq > 0) {
     alerts.push(`MOQ overstock triggered: +${Math.round(overstockFromMoq)} units above required quantity.`)
@@ -419,6 +435,15 @@ function findLaneId(lanes, preferredId, predicate) {
   return lane?.id || ''
 }
 
+function formatLaneDisplayName(lane, nodes) {
+  if (!lane) {
+    return 'Selected lane'
+  }
+  const source = nodes.find((node) => node.id === lane.from)
+  const target = nodes.find((node) => node.id === lane.to)
+  return `${lane.id}: ${source?.name || lane.from} -> ${target?.name || lane.to}`
+}
+
 function getPresetModel(
   presetId,
   model = { nodes: BASE_NODES, lanes: BASE_LANES, scenario: BASE_SCENARIO },
@@ -475,8 +500,9 @@ function getPresetModel(
     nextLanes = nextLanes.map((lane) => ({ ...lane, costPerUnit: lane.costPerUnit * 2 }))
     message = 'Lane penalty doubling preset loaded.'
   } else if (presetId === 'lane_unavailable') {
+    const disabledLane = nextLanes.find((lane) => lane.id === plantToDcLaneId)
     nextLanes = updateById(nextLanes, plantToDcLaneId, { active: false })
-    message = 'One lane unavailable preset loaded (representative lane disabled).'
+    message = `Lane unavailable preset loaded: ${formatLaneDisplayName(disabledLane, nextNodes)} is disabled.`
   } else if (presetId === 'moq_overstock') {
     nextScenario = { ...nextScenario, strategyId: 'split_50_50', demandDeltaPct: -0.25 }
     nextNodes = nextNodes.map((node) => (
@@ -692,6 +718,7 @@ export default function App() {
   const selectedLane = useMemo(() => lanes.find((lane) => lane.id === selectedLaneId) || null, [lanes, selectedLaneId])
 
   const result = useMemo(() => runScenario(nodes, lanes, scenario), [nodes, lanes, scenario])
+  const activeCostData = { ...DEFAULT_COST_DATA, ...scenario.costData }
 
   const nodeById = useMemo(() => Object.fromEntries(nodes.map((node) => [node.id, node])), [nodes])
 
@@ -701,6 +728,17 @@ export default function App() {
 
   function updateLane(laneId, patch) {
     setLanes((current) => current.map((lane) => (lane.id === laneId ? { ...lane, ...patch } : lane)))
+  }
+
+  function updateCostData(field, value) {
+    setScenario((prev) => ({
+      ...prev,
+      costData: {
+        ...DEFAULT_COST_DATA,
+        ...prev.costData,
+        [field]: Math.max(0, Number(value) || 0),
+      },
+    }))
   }
 
   function nextNodeId(type) {
@@ -1131,6 +1169,9 @@ export default function App() {
                   {' -> '}
                   {selectedLane.to}
                 </p>
+                <p className={selectedLane.active === false ? 'status-unavailable' : 'status-active'}>
+                  Status: {selectedLane.active === false ? 'Unavailable' : 'Active'}
+                </p>
                 <label>
                   Transportation Penalty / Unit
                   <input
@@ -1187,11 +1228,13 @@ export default function App() {
                       y1={y1}
                       x2={x2}
                       y2={y2}
-                      className={`lane ${selectedLane?.id === lane.id ? 'selected' : ''}`}
+                      className={`lane ${lane.active === false ? 'inactive' : ''} ${selectedLane?.id === lane.id ? 'selected' : ''}`}
                       onClick={(event) => onLaneClick(event, lane.id)}
                     />
-                    <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 8} className="lane-label">
-                      {lane.id} | {formatNumber(lane.costPerUnit, 2)} /u | {lane.leadTimeDays}d
+                    <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 8} className={`lane-label ${lane.active === false ? 'inactive' : ''}`}>
+                      {lane.active === false
+                        ? `${lane.id} | UNAVAILABLE | ${lane.from} -> ${lane.to}`
+                        : `${lane.id} | ${formatNumber(lane.costPerUnit, 2)} /u | ${lane.leadTimeDays}d`}
                     </text>
                   </g>
                 )
@@ -1249,9 +1292,56 @@ export default function App() {
               <li>Demand planning at customer/retailer level.</li>
               <li>Weekly demand time series (52-week annual horizon) with surge/drop windows.</li>
               <li>DC and plant inventory levels and safety constraints.</li>
+              <li>Per-unit cost data for plant, DC, and retailer penalties.</li>
               <li>Plant weekly capacity and supplier weekly capacities.</li>
               <li>Supplier ratio strategy: 70/30, 50/50, safest least-penalty.</li>
             </ul>
+          </div>
+
+          <div className="editor-card cost-data-card">
+            <h3>Cost Data Per Unit</h3>
+            <div className="cost-data-grid">
+              <label>
+                Product Penalty / Unit at Plant
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={activeCostData.plantProductPenaltyPerUnit}
+                  onChange={(event) => updateCostData('plantProductPenaltyPerUnit', event.target.value)}
+                />
+              </label>
+              <label>
+                Inventory Penalty / Unit at Plant
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={activeCostData.plantInventoryPenaltyPerUnit}
+                  onChange={(event) => updateCostData('plantInventoryPenaltyPerUnit', event.target.value)}
+                />
+              </label>
+              <label>
+                Inventory Penalty / Unit at DC
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={activeCostData.dcInventoryPenaltyPerUnit}
+                  onChange={(event) => updateCostData('dcInventoryPenaltyPerUnit', event.target.value)}
+                />
+              </label>
+              <label>
+                Missed Demand Penalty / Unit at Retailer
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={activeCostData.retailerMissedDemandPenaltyPerUnit}
+                  onChange={(event) => updateCostData('retailerMissedDemandPenaltyPerUnit', event.target.value)}
+                />
+              </label>
+            </div>
           </div>
 
           <div className="editor-card">
@@ -1340,115 +1430,10 @@ export default function App() {
             </select>
           </label>
 
-          <label>
-            Demand Delta: {formatPct(scenario.demandDeltaPct)}
-            <input
-              type="range"
-              min="-0.3"
-              max="0.5"
-              step="0.01"
-              value={scenario.demandDeltaPct}
-              onChange={(event) => setScenario((prev) => ({ ...prev, demandDeltaPct: Number(event.target.value) }))}
-            />
-          </label>
-
-          <div className="range-grid">
-            <label>
-              Shift Start Week
-              <input
-                type="number"
-                min="1"
-                max={DEMAND_PLANNING_WEEKS}
-                value={scenario.demandShiftStartWeek}
-                onChange={(event) =>
-                  setScenario((prev) => ({
-                    ...prev,
-                    demandShiftStartWeek: clamp(Number(event.target.value) || 1, 1, DEMAND_PLANNING_WEEKS),
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Shift End Week
-              <input
-                type="number"
-                min="1"
-                max={DEMAND_PLANNING_WEEKS}
-                value={scenario.demandShiftEndWeek}
-                onChange={(event) =>
-                  setScenario((prev) => ({
-                    ...prev,
-                    demandShiftEndWeek: clamp(Number(event.target.value) || DEMAND_PLANNING_WEEKS, 1, DEMAND_PLANNING_WEEKS),
-                  }))
-                }
-              />
-            </label>
-          </div>
-
-          <label>
-            Weeks {scenario.demandShiftStartWeek}-{scenario.demandShiftEndWeek} Demand Shift: {formatPct(scenario.demandShiftDeltaPct)}
-            <input
-              type="range"
-              min="-0.4"
-              max="0.5"
-              step="0.01"
-              value={scenario.demandShiftDeltaPct}
-              onChange={(event) => setScenario((prev) => ({ ...prev, demandShiftDeltaPct: Number(event.target.value) }))}
-            />
-          </label>
-
           <div className="editor-card demand-view-card">
             <h3>Demand Time Series View</h3>
             <DemandSeriesMiniChart rows={result.demandTrendRows} />
           </div>
-
-          <label>
-            Supplier Penalty Delta: {formatPct(scenario.supplierCostDeltaPct)}
-            <input
-              type="range"
-              min="-0.25"
-              max="0.4"
-              step="0.01"
-              value={scenario.supplierCostDeltaPct}
-              onChange={(event) => setScenario((prev) => ({ ...prev, supplierCostDeltaPct: Number(event.target.value) }))}
-            />
-          </label>
-
-          <label>
-            Supplier Lead Time Delta: {formatPct(scenario.supplierLeadTimeDeltaPct)}
-            <input
-              type="range"
-              min="-0.25"
-              max="0.5"
-              step="0.01"
-              value={scenario.supplierLeadTimeDeltaPct}
-              onChange={(event) => setScenario((prev) => ({ ...prev, supplierLeadTimeDeltaPct: Number(event.target.value) }))}
-            />
-          </label>
-
-          <label>
-            Transportation Penalty Delta: {formatPct(scenario.transportCostDeltaPct)}
-            <input
-              type="range"
-              min="-0.25"
-              max="0.5"
-              step="0.01"
-              value={scenario.transportCostDeltaPct}
-              onChange={(event) => setScenario((prev) => ({ ...prev, transportCostDeltaPct: Number(event.target.value) }))}
-            />
-          </label>
-
-          <label>
-            Service Level Target: {formatPct(scenario.serviceLevelTarget)}
-            <input
-              type="range"
-              min="0.9"
-              max="0.995"
-              step="0.005"
-              value={scenario.serviceLevelTarget}
-              onChange={(event) => setScenario((prev) => ({ ...prev, serviceLevelTarget: Number(event.target.value) }))}
-            />
-          </label>
 
           <div className="kpi-list">
             <div className="objective-focus"><span>Objective Function</span><strong>{formatCurrency(result.objectiveFunction)}</strong></div>
