@@ -7,11 +7,14 @@ const DEMAND_PLANNING_WEEKS = 52
 const DEMAND_STABLE_WEEKS = 40
 const DEMAND_SHIFT_START_WEEK = DEMAND_STABLE_WEEKS + 1
 const DEMAND_SHIFT_END_WEEK = DEMAND_PLANNING_WEEKS
-const DEFAULT_WEEKLY_DEMAND = 10000
-const DEFAULT_DEMAND_SHIFT_SERIES = [
-  10500, 10800, 11200, 11600, 12000, 12400,
-  12800, 12600, 12300, 11800, 11200, 10800,
+const DEFAULT_WEEKLY_DEMAND = 9900
+const DEFAULT_DEMAND_SHIFT_MULTIPLIERS = [
+  1.05, 1.08, 1.12, 1.16, 1.2, 1.24,
+  1.28, 1.26, 1.23, 1.18, 1.12, 1.08,
 ]
+const DEFAULT_DEMAND_SHIFT_SERIES = DEFAULT_DEMAND_SHIFT_MULTIPLIERS.map((multiplier) =>
+  Math.round(DEFAULT_WEEKLY_DEMAND * multiplier),
+)
 const DEFAULT_DEMAND_SERIES = Array.from({ length: DEMAND_PLANNING_WEEKS }, (_, index) => (
   index < DEMAND_STABLE_WEEKS
     ? DEFAULT_WEEKLY_DEMAND
@@ -718,6 +721,10 @@ export default function App() {
   const selectedLane = useMemo(() => lanes.find((lane) => lane.id === selectedLaneId) || null, [lanes, selectedLaneId])
 
   const result = useMemo(() => runScenario(nodes, lanes, scenario), [nodes, lanes, scenario])
+  const customerDemandTotal = useMemo(
+    () => nodes.filter((node) => node.type === 'customer').reduce((total, node) => total + (node.demand || 0), 0),
+    [nodes],
+  )
   const activeCostData = { ...DEFAULT_COST_DATA, ...scenario.costData }
 
   const nodeById = useMemo(() => Object.fromEntries(nodes.map((node) => [node.id, node])), [nodes])
@@ -738,6 +745,24 @@ export default function App() {
         ...prev.costData,
         [field]: Math.max(0, Number(value) || 0),
       },
+    }))
+  }
+
+  function updateCustomerDemand(nodeId, value) {
+    const nextDemand = Math.max(0, Number(value) || 0)
+    const nextCustomerDemandTotal = nodes.reduce((total, node) => {
+      if (node.type !== 'customer') {
+        return total
+      }
+      return total + (node.id === nodeId ? nextDemand : node.demand || 0)
+    }, 0)
+
+    updateNode(nodeId, { demand: nextDemand })
+    setScenario((prev) => ({
+      ...prev,
+      demandSeries: normalizeDemandSeries(prev.demandSeries, DEFAULT_WEEKLY_DEMAND).map((weekDemand, index) =>
+        index < DEMAND_STABLE_WEEKS ? nextCustomerDemandTotal : weekDemand,
+      ),
     }))
   }
 
@@ -1098,7 +1123,7 @@ export default function App() {
                     <input
                       type="number"
                       value={selectedNode.demand}
-                      onChange={(event) => updateNode(selectedNode.id, { demand: Number(event.target.value) })}
+                      onChange={(event) => updateCustomerDemand(selectedNode.id, event.target.value)}
                     />
                   </label>
                 ) : null}
@@ -1365,7 +1390,7 @@ export default function App() {
 
           <div className="editor-card weekly-demand-card">
             <h3>Weekly Demand Plan (Weeks 1-{DEMAND_PLANNING_WEEKS})</h3>
-            <p className="muted">Use this to model stable annual demand for weeks 1-{DEMAND_STABLE_WEEKS} and rise/drop in weeks {DEMAND_SHIFT_START_WEEK}-{DEMAND_SHIFT_END_WEEK}. Capacity values are treated as weekly capacity.</p>
+            <p className="muted">Weeks 1-{DEMAND_STABLE_WEEKS} default to customer total demand ({formatNumber(customerDemandTotal)} units). Weeks {DEMAND_SHIFT_START_WEEK}-{DEMAND_SHIFT_END_WEEK} model the annual rise/drop pattern.</p>
             <div className="button-row">
               <button
                 type="button"
@@ -1374,12 +1399,12 @@ export default function App() {
                   setScenario((prev) => ({
                     ...prev,
                     demandSeries: normalizeDemandSeries(prev.demandSeries, DEFAULT_WEEKLY_DEMAND).map((value, index) =>
-                      index < DEMAND_STABLE_WEEKS ? DEFAULT_WEEKLY_DEMAND : value,
+                      index < DEMAND_STABLE_WEEKS ? customerDemandTotal : value,
                     ),
                   }))
                 }
               >
-                Set Weeks 1-{DEMAND_STABLE_WEEKS} = 10,000
+                Set Weeks 1-{DEMAND_STABLE_WEEKS} = Customer Total
               </button>
               <button
                 type="button"
